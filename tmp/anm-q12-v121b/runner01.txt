@@ -1,0 +1,151 @@
+from __future__ import annotations
+import argparse, base64, json, logging, os, time, traceback, zlib
+from datetime import datetime, timezone
+from typing import Literal, Union
+
+import requests
+import torch
+import outlines
+import transformers
+import pydantic
+import bitsandbytes
+import accelerate
+import importlib.metadata
+from cryptography.fernet import Fernet
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
+from transformers import AutoConfig, AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
+
+# ---------------- Frozen output contracts ----------------
+class PassANotEssentialRecord(BaseModel):
+    model_config=ConfigDict(extra='forbid', strict=True)
+    best_answer: Literal['A','B','C','D']
+    essential_foundational_dependency: Literal[False]
+    foundational_prerequisite: None
+    removal_test: Literal['CAN_STILL_DISCRIMINATE']
+    brief_justification: str = Field(min_length=1)
+
+class PassAEssentialRecord(BaseModel):
+    model_config=ConfigDict(extra='forbid', strict=True)
+    best_answer: Literal['A','B','C','D']
+    essential_foundational_dependency: Literal[True]
+    foundational_prerequisite: str = Field(min_length=1)
+    removal_test: Literal['CANNOT_DEFENSIBLY_DISCRIMINATE']
+    brief_justification: str = Field(min_length=1)
+
+PassAOutput=Union[PassANotEssentialRecord,PassAEssentialRecord]
+PassAAdapter=TypeAdapter(PassAOutput)
+
+EncibDomain=Literal[
+    'ANATOMÍA','EMBRIOLOGÍA','HISTOLOGÍA','BIOQUÍMICA','FISIOLOGÍA',
+    'PATOLOGÍA','FARMACOLOGÍA','MICROBIOLOGÍA-PARASITOLOGÍA'
+]
+class PassBMappedRecord(BaseModel):
+    model_config=ConfigDict(extra='forbid', strict=True)
+    mapping_status: Literal['EXACT','PARTIAL']
+    encib_domain_or_domains: list[EncibDomain] = Field(min_length=1)
+    mapping_evidence: str = Field(min_length=1)
+
+class PassBNonMappableRecord(BaseModel):
+    model_config=ConfigDict(extra='forbid', strict=True)
+    mapping_status: Literal['FOUNDATIONAL_BUT_NOT_ENCIB_MAPPABLE']
+    encib_domain_or_domains: list[EncibDomain] = Field(max_length=0)
+    mapping_evidence: str = Field(min_length=1)
+
+class PassBUncertainRecord(BaseModel):
+    model_config=ConfigDict(extra='forbid', strict=True)
+    mapping_status: Literal['UNCERTAIN']
+    encib_domain_or_domains: list[EncibDomain]
+    mapping_evidence: str = Field(min_length=1)
+
+PassBOutput=Union[PassBMappedRecord,PassBNonMappableRecord,PassBUncertainRecord]
+PassBAdapter=TypeAdapter(PassBOutput)
+
+PA_MAX_NEW=240
+PB_MAX_NEW=220
+ST_MAX_NEW=240
+
+
+def utcnow():
+    return datetime.now(timezone.utc).isoformat()
+
+
+def post_paste(slug,payload,attempts=4):
+    body={
+      'title':slug,'custom_slug':slug,'visibility':'unlisted','expiry':'1h',
+      'language':'json','content':json.dumps(payload,ensure_ascii=False,indent=2)
+    }
+    last=None
+    for k in range(attempts):
+        try:
+            r=requests.post('https://pastepile.com/api/public/pastes',headers={'Content-Type':'application/json'},json=body,timeout=30)
+            if 200 <= r.status_code < 300:
+                return {'status_code':r.status_code,'text':r.text[:300]}
+            last=f'HTTP {r.status_code}: {r.text[:300]}'
+        except Exception as exc:
+            last=repr(exc)
+        time.sleep(2*(k+1))
+    raise RuntimeError(f'PERSISTENCE_FAILURE {slug}: {last}')
+
+
+def raw_url(path):
+    return f'https://raw.githubusercontent.com/claudiomedina17/python-example-2025/main/{path}'
+
+
+def fetch_bundle(paths_csv,key):
+    parts=[]
+    for path in [x.strip() for x in paths_csv.split(',') if x.strip()]:
+        r=requests.get(raw_url(path),timeout=60)
+        r.raise_for_status()
+        parts.append(r.text.strip())
+    if not parts:
+        raise RuntimeError('EMPTY_BUNDLE_PATH')
+    cipher=base64.b64decode(''.join(parts))
+    compressed=Fernet(key.encode()).decrypt(cipher)
+    plain=zlib.decompress(compressed)
+    return json.loads(plain.decode('utf-8'))
+
+
+def render_item(item):
+    return 'ITEM:\n'+item['stem']+'\n\nOPTIONS:\n'+'\n'.join(f'{k}. {v}' for k,v in item['options'].items())
+
+
+def render_messages(tok,system,user):
+    return tok.apply_chat_template([
+        {'role':'system','content':system},
+        {'role':'user','content':user},
+    ],tokenize=False,add_generation_prompt=True)
+
+
+def parse_generated(generated,adapter):
+    if isinstance(generated,BaseModel):
+        obj=generated.model_dump(); raw=generated.model_dump_json()
+    elif isinstance(generated,str):
+        raw=generated; obj=json.loads(raw)
+    else:
+        raw=str(generated); obj=json.loads(raw)
+    validated=adapter.validate_python(obj)
+    return raw,validated.model_dump()
+
+
+def context_candidates(cfg,tok):
+    vals=[]
+    for obj in [cfg,getattr(cfg,'text_config',None)]:
+        if obj is None: continue
+        for field in ['max_position_embeddings','n_positions','max_sequence_length','seq_length']:
+            v=getattr(obj,field,None)
+            if isinstance(v,int) and 0<v<10**9:
+                vals.append({'source':f'config.{field}','value':v})
+    tv=getattr(tok,'model_max_length',None)
+    if isinstance(tv,int) and 0<tv<10**9:
+        vals.append({'source':'tokenizer.model_max_length','value':tv})
+    return vals
+
+
+def token_count(tok,text):
+    return len(tok(text,add_special_tokens=False)['input_ids'])
+
+
+def main():
+    ap=argparse.ArgumentParser()
+    ap.add_argument('--candidate-id',required=True)
+    ap.add_argum
