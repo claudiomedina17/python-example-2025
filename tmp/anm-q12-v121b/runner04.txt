@@ -1,0 +1,56 @@
++=1
+                persist('PB',idx,{'probe_id':item['probe_id'],'source_probe_id':source,'classification':'SCHEMA_FAILURE','raw':str(generated or ''),'parsed':None,'error':repr(exc),'mapping_score':None})
+                if state['qg3_invalid']>2:state['outcome']='NOT_QUALIFIED';state['stop_reason']='QG3_THIRD_INVALID';break
+                continue
+            except Exception as exc:
+                state['outcome']='EXECUTION_INVALID';state['stop_reason']='PB_DECODER_OR_RUNTIME_FAILURE';persist('PB',idx,{'probe_id':item['probe_id'],'source_probe_id':source,'classification':'DECODER_FAILURE','raw':str(generated or ''),'parsed':None,'error':repr(exc),'mapping_score':None});break
+            state['pb']['attempted']+=1;state['pb']['valid']+=1
+            sc=obj['mapping_status']==key['expected_mapping_status']; dmc=sorted(obj['encib_domain_or_domains'])==sorted(key['expected_domains']); joint=sc and dmc
+            if joint:state['pb']['correct']+=1
+            else:state['pb']['errors']+=1
+            persist('PB',idx,{'probe_id':item['probe_id'],'source_probe_id':source,'classification':'SEMANTIC_VALID_COMPLETION','raw':raw,'parsed':obj,'mapping_score':{'status_correct':sc,'domains_correct':dmc,'joint_correct':joint,'expected_status':key['expected_mapping_status'],'expected_domains':key['expected_domains']}})
+            remaining=12-state['pb']['attempted']
+            if state['pb']['correct']+remaining<10:state['outcome']='NOT_QUALIFIED';state['stop_reason']='QG4_IRREVERSIBLE';break
+        if state['outcome'] is not None:return final_post()
+        if not (state['pb']['attempted']==12 and state['pb']['correct']>=10 and state['qg3_invalid']<=2):state['outcome']='NOT_QUALIFIED';state['stop_reason']='QG4_FINAL_GATE_FAIL';return final_post()
+
+        # ---------- Stability ----------
+        required=[st_source[x['probe_id']] for x in bundle['stability_packet']]
+        missing=[x for x in required if x not in first_pa]
+        if missing:
+            state['outcome']='NOT_QUALIFIED';state['stop_reason']='QG5_BASELINE_INVALID';persist('STBASE',1,{'classification':'QG5_BASELINE_INVALID','missing_source_item_ids':missing,'semantic_score':None});return final_post()
+        for idx,item in enumerate(bundle['stability_packet'],1):
+            source=st_source[item['probe_id']];original=first_pa[source]
+            rendered=render_messages(tok,bundle['pass_a_prompt'],render_item(item)); generated=None
+            try:
+                generated=model(rendered,PassAOutput,max_new_tokens=ST_MAX_NEW,temperature=0)
+                raw,obj=parse_generated(generated,PassAAdapter)
+            except (json.JSONDecodeError,pydantic.ValidationError) as exc:
+                state['qg3_invalid']+=1;state['st']['attempted']+=1;state['st']['invalid']+=1
+                persist('ST',idx,{'probe_id':item['probe_id'],'source_item_id':source,'classification':'SCHEMA_FAILURE','raw':str(generated or ''),'parsed':None,'error':repr(exc),'stability_score':None});state['outcome']='NOT_QUALIFIED';state['stop_reason']='QG5_REQUIRES_ALL_STRUCTURALLY_VALID';break
+            except Exception as exc:
+                state['outcome']='EXECUTION_INVALID';state['stop_reason']='ST_DECODER_OR_RUNTIME_FAILURE';persist('ST',idx,{'probe_id':item['probe_id'],'source_item_id':source,'classification':'DECODER_FAILURE','raw':str(generated or ''),'parsed':None,'error':repr(exc),'stability_score':None});break
+            state['st']['attempted']+=1;state['st']['valid']+=1
+            ls=obj['essential_foundational_dependency']==original['essential_foundational_dependency']; ans=obj['best_answer']==original['best_answer']
+            if ls:state['st']['label_same']+=1
+            else:state['st']['label_mismatch']+=1
+            if ans:state['st']['answer_same']+=1
+            persist('ST',idx,{'probe_id':item['probe_id'],'source_item_id':source,'classification':'SEMANTIC_VALID_COMPLETION','raw':raw,'parsed':obj,'stability_score':{'label_same':ls,'answer_same':ans,'original_label':original['essential_foundational_dependency'],'original_answer':original['best_answer']}})
+            if state['st']['label_mismatch']>1:state['outcome']='NOT_QUALIFIED';state['stop_reason']='QG5_SECOND_LABEL_MISMATCH';break
+        if state['outcome'] is not None:return final_post()
+        if state['st']['attempted']==10 and state['st']['invalid']==0 and state['st']['label_same']>=9 and state['st']['answer_same']>=9 and state['qg3_invalid']<=2:
+            state['outcome']='QUALIFIED';state['stop_reason']='ALL_GATES_PASS'
+        else:state['outcome']='NOT_QUALIFIED';state['stop_reason']='QG5_FINAL_GATE_FAIL'
+        return final_post()
+    except Exception as exc:
+        state['outcome']='EXECUTION_INVALID_PRE_EXPOSURE' if state['fresh_exposure_started_utc'] is None else 'EXECUTION_INVALID'
+        state['stop_reason']='PREFLIGHT_OR_LOAD_FAILURE' if state['fresh_exposure_started_utc'] is None else 'UNHANDLED_EXCEPTION_AFTER_EXPOSURE'
+        state['exception']=repr(exc);state['traceback']=traceback.format_exc(limit=10)
+        try:return final_post()
+        except Exception as final_exc:
+            print('FINAL_PERSISTENCE_FAILURE '+repr(final_exc),flush=True)
+            print(json.dumps({'state':state,'records':records},ensure_ascii=False),flush=True)
+            raise
+
+if __name__=='__main__':
+    main()
