@@ -1,0 +1,73 @@
+ent('--repo',required=True)
+    ap.add_argument('--revision',required=True)
+    ap.add_argument('--bundle-path',required=True)
+    ap.add_argument('--result-prefix',required=True)
+    args=ap.parse_args()
+    prefix=args.result_prefix
+    records=[]
+    state={
+      'candidate_id':args.candidate_id,'repo':args.repo,'revision':args.revision,
+      'started_utc':utcnow(),'fresh_exposure_started_utc':None,'outcome':None,'stop_reason':None,
+      'pa':{'attempted':0,'valid':0,'correct_answer':0,'correct_dependency':0,'answer_errors':0,'dependency_errors':0,'class_errors':{'A':0,'B':0,'C':0}},
+      'qg3_invalid':0,
+      'pb':{'attempted':0,'valid':0,'correct':0,'errors':0},
+      'st':{'attempted':0,'valid':0,'label_same':0,'label_mismatch':0,'answer_same':0,'invalid':0},
+    }
+
+    def persist(phase,seq,rec):
+        r={'candidate_id':args.candidate_id,'phase':phase,'sequence':seq,'timestamp':utcnow(),**rec}
+        records.append(r)
+        print('ATTEMPT_RECORD '+json.dumps(r,ensure_ascii=False),flush=True)
+        post_paste(f'{prefix}-{phase.lower()}-{seq:03d}',r)
+        return r
+
+    def final_post():
+        payload={
+          'candidate_id':args.candidate_id,'repo':args.repo,'revision':args.revision,
+          'finalized_utc':utcnow(),'state':state,'records':records,
+          'versions':{
+            'transformers':transformers.__version__,'outlines':importlib.metadata.version('outlines'),
+            'pydantic':pydantic.__version__,'torch':torch.__version__,
+            'accelerate':accelerate.__version__,'bitsandbytes':bitsandbytes.__version__,
+          }
+        }
+        post_paste(f'{prefix}-final',payload)
+        print('FINAL_SUMMARY '+json.dumps(payload,ensure_ascii=False),flush=True)
+        return payload
+
+    try:
+        # ---------- Stage 1: runtime preflight; zero fresh material read ----------
+        if transformers.__version__!='4.57.3': raise RuntimeError(f'TRANSFORMERS_VERSION_MISMATCH {transformers.__version__}')
+        if importlib.metadata.version('outlines')!='1.3.2': raise RuntimeError(f'OUTLINES_VERSION_MISMATCH {importlib.metadata.version("outlines")}')
+        if pydantic.__version__!='2.13.4': raise RuntimeError(f'PYDANTIC_VERSION_MISMATCH {pydantic.__version__}')
+        if torch.__version__.split('+')[0]!='2.8.0': raise RuntimeError(f'TORCH_VERSION_MISMATCH {torch.__version__}')
+        if accelerate.__version__!='1.14.0': raise RuntimeError(f'ACCELERATE_VERSION_MISMATCH {accelerate.__version__}')
+        if bitsandbytes.__version__!='0.48.2': raise RuntimeError(f'BITSANDBYTES_VERSION_MISMATCH {bitsandbytes.__version__}')
+
+        cfg=AutoConfig.from_pretrained(args.repo,revision=args.revision,token=os.environ.get('HF_TOKEN'),trust_remote_code=False)
+        tok=AutoTokenizer.from_pretrained(args.repo,revision=args.revision,token=os.environ.get('HF_TOKEN'),trust_remote_code=False,use_fast=True)
+        if not getattr(tok,'chat_template',None): raise RuntimeError('CHAT_TEMPLATE_MISSING')
+        bnb=BitsAndBytesConfig(load_in_4bit=True,bnb_4bit_quant_type='nf4',bnb_4bit_compute_dtype=torch.bfloat16,bnb_4bit_use_double_quant=True)
+        hf_model=AutoModelForCausalLM.from_pretrained(args.repo,revision=args.revision,token=os.environ.get('HF_TOKEN'),quantization_config=bnb,device_map='auto',torch_dtype=torch.bfloat16,trust_remote_code=False)
+        hf_model.eval()
+        model=outlines.from_transformers(hf_model,tok)
+        tech=render_messages(tok,'Return one legal structured PASS-A object. This is a non-qualification technical decoder smoke.','The correct option is explicitly A. A. Correct B. Incorrect C. Incorrect D. Incorrect')
+        micro=model(tech,PassAOutput,max_new_tokens=120,temperature=0)
+        _,micro_obj=parse_generated(micro,PassAAdapter)
+        post_paste(f'{prefix}-preflight-stage1',{
+          'status':'RUNTIME_STAGE1_PASS','candidate_id':args.candidate_id,'repo':args.repo,'revision':args.revision,
+          'model_type':getattr(cfg,'model_type',None),'architectures':getattr(cfg,'architectures',None),
+          'context_candidates':context_candidates(cfg,tok),'chat_template_present':True,
+          'decoder_micro_smoke':micro_obj,'gpu':torch.cuda.get_device_name(0) if torch.cuda.is_available() else None,'timestamp':utcnow()
+        })
+
+        # ---------- Stage 2: decrypt and context-check all exact frozen inputs; still zero model exposure ----------
+        bundle=fetch_bundle(args.bundle_path,os.environ['BUNDLE_KEY'])
+        if bundle['fresh_set_version']!='v1.2.1': raise RuntimeError('FRESH_SET_VERSION_MISMATCH')
+        contexts=context_candidates(cfg,tok)
+        if not contexts: raise RuntimeError('EFFECTIVE_CONTEXT_UNRESOLVED')
+        effective=min(x['value'] for x in contexts)
+        max_pa=max((token_count(tok,render_messages(tok,bundle['pass_a_prompt'],render_item(x))),x['probe_id']) for x in bundle['pass_a_packet'])
+        max_pb=max((token_count(tok,render_messages(tok,bundle['pass_b_prompt'],json.dumps({'locked_foundational_prerequisite':x['locked_foundational_prerequisite'],'encib_reference':x['encib_reference']},ensure_ascii=False))),x['probe_id']) for x in bundle['pass_b_packet'])
+        max_st=max((token_count(tok,render_messages(tok,bundle['pass_a_prompt'],render_item(x))),x['probe_id']) for x in bundle['stability_packet'])
+        if max_pa[0]+PA_MAX_NEW>effec
