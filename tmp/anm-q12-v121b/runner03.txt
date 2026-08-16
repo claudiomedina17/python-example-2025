@@ -1,0 +1,61 @@
+tive: raise RuntimeError(f'PA_CONTEXT_EXCEEDED {max_pa[0]}+{PA_MAX_NEW}>{effective}')
+        if max_pb[0]+PB_MAX_NEW>effective: raise RuntimeError(f'PB_CONTEXT_EXCEEDED {max_pb[0]}+{PB_MAX_NEW}>{effective}')
+        if max_st[0]+ST_MAX_NEW>effective: raise RuntimeError(f'ST_CONTEXT_EXCEEDED {max_st[0]}+{ST_MAX_NEW}>{effective}')
+        post_paste(f'{prefix}-preflight-stage2',{
+          'status':'PRE_EXPOSURE_CONTEXT_PASS','effective_context':effective,'context_candidates':contexts,
+          'max_pa_input_tokens':max_pa,'max_pb_input_tokens':max_pb,'max_st_input_tokens':max_st,
+          'fresh_model_exposure':False,'timestamp':utcnow()
+        })
+
+        pa_source={m['probe_id']:m['item_id'] for m in bundle['pass_a_id_map']['mapping']}
+        pa_key={x['item_id']:x for x in bundle['pass_a_key']}
+        pb_source={m['probe_id']:m['source_probe_id'] for m in bundle['pass_b_id_map']['mapping']}
+        pb_key={x['probe_id']:x for x in bundle['pass_b_key']}
+        st_source={m['probe_id']:m['item_id'] for m in bundle['stability_id_map']['mapping']}
+        first_pa={}
+
+        state['fresh_exposure_started_utc']=utcnow()
+        post_paste(f'{prefix}-exposure-start',{'candidate_id':args.candidate_id,'fresh_exposure_started_utc':state['fresh_exposure_started_utc'],'fresh_set_version':'v1.2.1'})
+
+        # ---------- PASS A ----------
+        for idx,item in enumerate(bundle['pass_a_packet'],1):
+            source=pa_source[item['probe_id']]; key=pa_key[source]
+            rendered=render_messages(tok,bundle['pass_a_prompt'],render_item(item)); generated=None
+            try:
+                generated=model(rendered,PassAOutput,max_new_tokens=PA_MAX_NEW,temperature=0)
+                raw,obj=parse_generated(generated,PassAAdapter)
+            except (json.JSONDecodeError,pydantic.ValidationError) as exc:
+                state['qg3_invalid']+=1; state['pa']['attempted']+=1
+                persist('PA',idx,{'probe_id':item['probe_id'],'source_item_id':source,'classification':'SCHEMA_FAILURE','raw':str(generated or ''),'parsed':None,'error':repr(exc),'semantic_score':None})
+                if state['qg3_invalid']>2: state['outcome']='NOT_QUALIFIED';state['stop_reason']='QG3_THIRD_INVALID';break
+                continue
+            except torch.OutOfMemoryError as exc:
+                state['outcome']='EXECUTION_INVALID';state['stop_reason']='OOM_AFTER_EXPOSURE';persist('PA',idx,{'probe_id':item['probe_id'],'source_item_id':source,'classification':'OOM','raw':None,'parsed':None,'error':repr(exc),'semantic_score':None});break
+            except Exception as exc:
+                state['outcome']='EXECUTION_INVALID';state['stop_reason']='PA_DECODER_OR_RUNTIME_FAILURE';persist('PA',idx,{'probe_id':item['probe_id'],'source_item_id':source,'classification':'DECODER_FAILURE','raw':str(generated or ''),'parsed':None,'error':repr(exc),'semantic_score':None});break
+            state['pa']['attempted']+=1;state['pa']['valid']+=1
+            ac=obj['best_answer']==key['expected_best_answer']; dc=obj['essential_foundational_dependency']==key['expected_essential']; cls=key['class_A_B_C']
+            if ac:state['pa']['correct_answer']+=1
+            else:state['pa']['answer_errors']+=1
+            if dc:state['pa']['correct_dependency']+=1
+            else:state['pa']['dependency_errors']+=1;state['pa']['class_errors'][cls]+=1
+            first_pa[source]=obj
+            persist('PA',idx,{'probe_id':item['probe_id'],'source_item_id':source,'classification':'SEMANTIC_VALID_COMPLETION','raw':raw,'parsed':obj,'semantic_score':{'expected_best_answer':key['expected_best_answer'],'answer_correct':ac,'expected_essential':key['expected_essential'],'dependency_correct':dc,'class':cls}})
+            remaining=30-state['pa']['attempted']
+            if state['pa']['correct_answer']+remaining<27: state['outcome']='NOT_QUALIFIED';state['stop_reason']='QG1_IRREVERSIBLE';break
+            if state['pa']['correct_dependency']+remaining<27: state['outcome']='NOT_QUALIFIED';state['stop_reason']='QG2_OVERALL_IRREVERSIBLE';break
+            if any(v>2 for v in state['pa']['class_errors'].values()): state['outcome']='NOT_QUALIFIED';state['stop_reason']='QG2_DIRECTIONAL_CAP';break
+        if state['outcome'] is not None:return final_post()
+        if not (state['pa']['attempted']==30 and state['pa']['correct_answer']>=27 and state['pa']['correct_dependency']>=27 and all(v<=2 for v in state['pa']['class_errors'].values()) and state['qg3_invalid']<=2):
+            state['outcome']='NOT_QUALIFIED';state['stop_reason']='PASS_A_FINAL_GATE_FAIL';return final_post()
+
+        # ---------- PASS B ----------
+        for idx,item in enumerate(bundle['pass_b_packet'],1):
+            source=pb_source[item['probe_id']]; key=pb_key[source]
+            user=json.dumps({'locked_foundational_prerequisite':item['locked_foundational_prerequisite'],'encib_reference':item['encib_reference']},ensure_ascii=False)
+            rendered=render_messages(tok,bundle['pass_b_prompt'],user); generated=None
+            try:
+                generated=model(rendered,PassBOutput,max_new_tokens=PB_MAX_NEW,temperature=0)
+                raw,obj=parse_generated(generated,PassBAdapter)
+            except (json.JSONDecodeError,pydantic.ValidationError) as exc:
+                state['qg3_invalid']+=1;state['pb']['attempted']
